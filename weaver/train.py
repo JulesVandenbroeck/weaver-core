@@ -138,6 +138,19 @@ parser.add_argument('--batch-size-val', type=int, default=None,
                     help='batch size for validation dataset')
 parser.add_argument('--batch-size-test', type=int, default=None,
                     help='batch size for test dataset')
+parser.add_argument('--adabatch-factor', type=int, default=1,
+                    help='AdaBatch: multiply the effective batch size by this factor every `--adabatch-every` epochs, '
+                         'by accumulating the gradients of several batches (of `--batch-size`) per optimizer step; '
+                         '1 (default) disables it')
+parser.add_argument('--adabatch-every', type=int, default=10,
+                    help='AdaBatch: number of epochs between two increases of the effective batch size')
+parser.add_argument('--adabatch-start-epoch', type=int, default=None,
+                    help='AdaBatch: first epoch with an increased effective batch size; defaults to `--adabatch-every`')
+parser.add_argument('--adabatch-max-accum', type=int, default=8,
+                    help='AdaBatch: maximum number of batches accumulated per optimizer step')
+parser.add_argument('--adabatch-lr-exp', type=float, default=0,
+                    help='AdaBatch: scale the learning rate by `accumulation_steps ** exp`; '
+                         '0 (default): no scaling, 0.5: sqrt scaling (Adam), 1: linear scaling (SGD)')
 parser.add_argument('--use-amp', action=argparse.BooleanOptionalAction, default=False,
                     help='use mixed precision training (fp16)')
 parser.add_argument('--amp-dtype', type=str, default='bf16', choices=['fp16', 'bf16'],
@@ -1095,6 +1108,8 @@ def _main(args):
         # training loop
         best_valid_metric = np.inf if args.regression_mode else 0
         grad_scaler = torch.GradScaler("cuda") if args.use_amp and args.amp_dtype == "fp16" else None
+        if args.adabatch_factor > 1:
+            from weaver.utils.nn.adabatch import adabatch_setup
         for epoch in range(args.num_epochs):
             if args.load_epoch is not None:
                 if epoch <= args.load_epoch:
@@ -1103,6 +1118,7 @@ def _main(args):
 
             if "train" in args.run_mode:
                 _logger.info("Epoch #%d training" % epoch)
+                train_kwargs = adabatch_setup(args, opt, scheduler, epoch, tb) if args.adabatch_factor > 1 else {}
                 train(
                     model,
                     loss_func,
@@ -1115,6 +1131,7 @@ def _main(args):
                     grad_scaler=grad_scaler,
                     tb_helper=tb,
                     extra_args=locals(),
+                    **train_kwargs,
                 )
                 if args.model_prefix and (args.backend is None or local_rank == 0):
                     dirname = os.path.dirname(args.model_prefix)

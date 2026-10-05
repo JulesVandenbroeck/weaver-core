@@ -2,6 +2,7 @@ import numpy as np
 import awkward as ak
 import tqdm
 import time
+import contextlib
 import torch
 import torch.distributed as dist
 
@@ -109,6 +110,20 @@ def unwrap_model(model):
     return model
 
 
+def _grad_sync_context(model, sync):
+    """
+    Returns a context manager to skip the gradient all-reduce of a DistributedDataParallel model (possibly wrapped
+    by torch.compile) when accumulating gradients over several batches, i.e., when `sync` is False.
+    The forward pass must run inside this context: DDP decides there whether the following backward pass all-reduces.
+    """
+    if not sync:
+        while hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            return model.no_sync()
+    return contextlib.nullcontext()
+
+
 def get_autocast_config(args):
     enable_autocast = args.use_amp
     if args.amp_dtype == 'bf16':
@@ -120,7 +135,7 @@ def get_autocast_config(args):
 
 def train_classification(
         model, loss_func, opt, scheduler, train_loader, dev, epoch, steps_per_epoch=None, grad_scaler=None,
-        tb_helper=None, extra_args=None):
+        tb_helper=None, extra_args=None, accum_steps=1):
     model.train()
 
     data_config = train_loader.dataset.config
@@ -133,6 +148,7 @@ def train_classification(
     entry_count = 0
     count = 0
     grad_norm_max_val = 0
+    grad_norm = 0
 
     enable_autocast, autocast_dtype = get_autocast_config(extra_args['args'])
 
@@ -148,22 +164,28 @@ def train_classification(
                 mask = None
             if tb_helper:
                 tb_helper.global_step += 1
-            opt.zero_grad()
-            with torch.autocast('cuda', enabled=enable_autocast, dtype=autocast_dtype):
+            # accumulate the gradients of `accum_steps` batches per optimizer step
+            do_step = (num_batches + 1) % accum_steps == 0
+            if num_batches % accum_steps == 0:
+                opt.zero_grad()
+            sync_context = _grad_sync_context(model, do_step)
+            with sync_context, torch.autocast('cuda', enabled=enable_autocast, dtype=autocast_dtype):
                 model_output = model(*inputs)
                 logits, label, _ = _flatten_preds(model_output, label=label, mask=mask)
                 loss = loss_func(logits, label)
             if grad_scaler is None:
-                loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm).item()
-                opt.step()
+                (loss / accum_steps).backward()
+                if do_step:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm).item()
+                    opt.step()
             else:
-                grad_scaler.scale(loss).backward()
-                # unscale the gradients, then clipping
-                grad_scaler.unscale_(opt)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm).item()
-                grad_scaler.step(opt)
-                grad_scaler.update()
+                grad_scaler.scale(loss / accum_steps).backward()
+                if do_step:
+                    # unscale the gradients, then clipping
+                    grad_scaler.unscale_(opt)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm).item()
+                    grad_scaler.step(opt)
+                    grad_scaler.update()
 
             if scheduler and getattr(scheduler, '_update_per_step', False):
                 scheduler.step()
@@ -390,7 +412,7 @@ def evaluate_onnx(model_path, test_loader, eval_metrics=['roc_auc_score', 'roc_a
 
 def train_regression(
         model, loss_func, opt, scheduler, train_loader, dev, epoch, steps_per_epoch=None, grad_scaler=None,
-        tb_helper=None, extra_args=None):
+        tb_helper=None, extra_args=None, accum_steps=1):
     model.train()
 
     data_config = train_loader.dataset.config
@@ -402,6 +424,7 @@ def train_regression(
     sum_sqr_err = 0
     count = 0
     grad_norm_max_val = 0
+    grad_norm = 0
 
     enable_autocast, autocast_dtype = get_autocast_config(extra_args['args'])
 
@@ -414,22 +437,28 @@ def train_regression(
             label = label.to(dev)
             if tb_helper:
                 tb_helper.global_step += 1
-            opt.zero_grad()
-            with torch.autocast('cuda', enabled=enable_autocast, dtype=autocast_dtype):
+            # accumulate the gradients of `accum_steps` batches per optimizer step
+            do_step = (num_batches + 1) % accum_steps == 0
+            if num_batches % accum_steps == 0:
+                opt.zero_grad()
+            sync_context = _grad_sync_context(model, do_step)
+            with sync_context, torch.autocast('cuda', enabled=enable_autocast, dtype=autocast_dtype):
                 model_output = model(*inputs)
                 preds = model_output.squeeze()
                 loss = loss_func(preds, label)
             if grad_scaler is None:
-                loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm).item()
-                opt.step()
+                (loss / accum_steps).backward()
+                if do_step:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm).item()
+                    opt.step()
             else:
-                grad_scaler.scale(loss).backward()
-                # unscale the gradients, then clipping
-                grad_scaler.unscale_(opt)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm).item()
-                grad_scaler.step(opt)
-                grad_scaler.update()
+                grad_scaler.scale(loss / accum_steps).backward()
+                if do_step:
+                    # unscale the gradients, then clipping
+                    grad_scaler.unscale_(opt)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm).item()
+                    grad_scaler.step(opt)
+                    grad_scaler.update()
 
             if scheduler and getattr(scheduler, '_update_per_step', False):
                 scheduler.step()
